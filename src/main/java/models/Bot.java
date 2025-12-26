@@ -26,6 +26,7 @@ public class Bot extends TelegramLongPollingBot {
     private Map<Long, Map<String, String>> tempDataMap = new HashMap<>(); // Временные данные пользователей
     private ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(10); // Планировщик задач
     private Map<String, ScheduledFuture<?>> meetingTasks = new HashMap<>(); // Задачи встреч
+    private Map<Long, Integer> lastMessageIdMap = new HashMap<>(); // ID последних сообщений для редактирования
 
     private DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
 
@@ -49,13 +50,13 @@ public class Bot extends TelegramLongPollingBot {
         Long chatId = update.getMessage().getChatId();
         String chatIdStr = chatId.toString();
 
-        SendMessage message = new SendMessage();
-        message.setChatId(chatIdStr);
-
         String state = userStates.get(chatIdStr);
 
         // Обработка команд меню
-        if (text.equals("/start") || text.equals("/menu")) {
+        if (text.equals("/start")) {
+            showWelcomeScreen(chatId);
+            return;
+        } else if (text.equals("/menu")) {
             showMainMenu(chatId);
             return;
         }
@@ -64,54 +65,22 @@ public class Bot extends TelegramLongPollingBot {
         if (state != null) {
             switch (state) {
                 case "ожидание имени":
-                    Map<String, String> clientData = new HashMap<>();
-                    clientData.put("name", text);
-                    tempDataMap.put(chatId, clientData);
-                    message.setText("Введите номер телефона клиента:");
-                    userStates.put(chatIdStr, "ожидание телефона");
+                    handleNameInput(chatId, text);
                     break;
 
                 case "ожидание телефона":
-                    tempDataMap.get(chatId).put("phone", text);
-                    message.setText("Введите город для поиска недвижимости:");
-                    userStates.put(chatIdStr, "ожидание города");
+                    handlePhoneInput(chatId, text);
                     break;
 
                 case "ожидание города":
-                    tempDataMap.get(chatId).put("city", text);
-                    message.setText("Выберите тип недвижимости:");
-                    message.setReplyMarkup(getPropertyTypeKeyboard());
-                    userStates.put(chatIdStr, "ожидание типа");
+                    handleCityInput(chatId, text);
                     break;
 
-                case "ожидание даты встречи":
-                    try {
-                        LocalDateTime meetingTime = LocalDateTime.parse(text + ":00", DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-                        if (meetingTime.isBefore(LocalDateTime.now())) {
-                            message.setText("Дата встречи не может быть в прошлом! Введите дату и время встречи (формат: ГГГГ-ММ-ДД ЧЧ:ММ):");
-                        } else {
-                            Map<String, String> data = tempDataMap.get(chatId);
-                            String name = data.get("name");
-                            String phone = data.get("phone");
-                            String city = data.get("city");
-                            String propertyType = data.get("type");
-
-                            saveClientToDatabase(name, phone, city, propertyType, text);
-                            scheduleMeetingNotifications(chatId, name, phone, text);
-
-                            message.setText("✅ Клиент " + name + " успешно создан!\n" +
-                                    "📅 Встреча назначена на: " + text + "\n\n" +
-                                    "Вы получите уведомления о встрече.");
-                            userStates.remove(chatIdStr);
-                            tempDataMap.remove(chatId);
-                            message.setReplyMarkup(getBackToMenuKeyboard());
-                        }
-                    } catch (Exception e) {
-                        message.setText("Неверный формат даты! Используйте формат: ГГГГ-ММ-ДД ЧЧ:ММ\nНапример: 2024-12-25 14:30");
-                    }
+                case "ожидание даты звонка":
+                    handleCallDateInput(chatId, text);
                     break;
 
-                case "поиск клиента для встречи":
+                case "поиск клиента для звонка":
                     searchClientForMeeting(chatId, text);
                     return;
 
@@ -123,26 +92,21 @@ public class Bot extends TelegramLongPollingBot {
                     searchClientForDelete(chatId, text);
                     return;
 
-                case "изменение параметра":
-                    String param = userStates.get(chatIdStr + "_param");
-                    int clientId = Integer.parseInt(userStates.get(chatIdStr + "_clientId"));
-                    updateClientParameter(chatId, clientId, param, text, message);
-                    userStates.remove(chatIdStr);
-                    userStates.remove(chatIdStr + "_param");
-                    userStates.remove(chatIdStr + "_clientId");
-                    message.setReplyMarkup(getBackToMenuKeyboard());
+                case "изменение имени":
+                case "изменение телефона ввод":
+                case "изменение города":
+                    handleTextParameterChange(chatId, text);
                     break;
 
                 case "отложить дни":
                     try {
                         int days = Integer.parseInt(text);
                         String meetingKey = userStates.get(chatIdStr + "_postpone");
-                        postponeMeeting(chatId, meetingKey, days, 0, 0, message);
+                        postponeMeeting(chatId, meetingKey, days, 0, 0);
                         userStates.remove(chatIdStr);
                         userStates.remove(chatIdStr + "_postpone");
-                        message.setReplyMarkup(getBackToMenuKeyboard());
                     } catch (NumberFormatException e) {
-                        message.setText("Введите число дней:");
+                        editMessage(chatId, "Введите число дней:");
                     }
                     break;
 
@@ -150,12 +114,11 @@ public class Bot extends TelegramLongPollingBot {
                     try {
                         int hours = Integer.parseInt(text);
                         String meetingKey = userStates.get(chatIdStr + "_postpone");
-                        postponeMeeting(chatId, meetingKey, 0, hours, 0, message);
+                        postponeMeeting(chatId, meetingKey, 0, hours, 0);
                         userStates.remove(chatIdStr);
                         userStates.remove(chatIdStr + "_postpone");
-                        message.setReplyMarkup(getBackToMenuKeyboard());
                     } catch (NumberFormatException e) {
-                        message.setText("Введите число часов:");
+                        editMessage(chatId, "Введите число часов:");
                     }
                     break;
 
@@ -163,29 +126,27 @@ public class Bot extends TelegramLongPollingBot {
                     try {
                         int minutes = Integer.parseInt(text);
                         String meetingKey = userStates.get(chatIdStr + "_postpone");
-                        postponeMeeting(chatId, meetingKey, 0, 0, minutes, message);
+                        postponeMeeting(chatId, meetingKey, 0, 0, minutes);
                         userStates.remove(chatIdStr);
                         userStates.remove(chatIdStr + "_postpone");
-                        message.setReplyMarkup(getBackToMenuKeyboard());
                     } catch (NumberFormatException e) {
-                        message.setText("Введите число минут:");
+                        editMessage(chatId, "Введите число минут:");
                     }
                     break;
 
-                case "встреча дата":
+                case "звонок дата":
                     try {
                         int clientIdForMeeting = Integer.parseInt(userStates.get(chatIdStr + "_meeting_client"));
                         LocalDateTime newTime = LocalDateTime.parse(text + ":00", DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
                         if (newTime.isBefore(LocalDateTime.now())) {
-                            message.setText("Дата встречи не может быть в прошлом! Введите новую дату и время (формат: ГГГГ-ММ-ДД ЧЧ:ММ):");
+                            editMessage(chatId, "Дата звонка не может быть в прошлом! Введите новую дату и время (формат: ГГГГ-ММ-ДД ЧЧ:ММ):");
                         } else {
-                            updateMeetingTime(chatId, clientIdForMeeting, text, message);
+                            updateMeetingTime(chatId, clientIdForMeeting, text);
                             userStates.remove(chatIdStr);
                             userStates.remove(chatIdStr + "_meeting_client");
-                            message.setReplyMarkup(getBackToMenuKeyboard());
                         }
                     } catch (Exception e) {
-                        message.setText("Неверный формат даты! Используйте формат: ГГГГ-ММ-ДД ЧЧ:ММ");
+                        editMessage(chatId, "Неверный формат даты! Используйте формат: ГГГГ-ММ-ДД ЧЧ:ММ");
                     }
                     break;
 
@@ -197,12 +158,183 @@ public class Bot extends TelegramLongPollingBot {
             showMainMenu(chatId);
             return;
         }
+    }
 
-        try {
-            execute(message);
-        } catch (Exception e) {
+    // Обработка ввода имени
+    private void handleNameInput(Long chatId, String name) {
+        String chatIdStr = chatId.toString();
+        Map<String, String> clientData = new HashMap<>();
+        clientData.put("name", name);
+        tempDataMap.put(chatId, clientData);
+
+        editMessage(chatId,
+                "👤 Имя клиента: " + name + "\n\n" +
+                        "📱 Введите номер телефона клиента (формат: 81234567890):");
+        userStates.put(chatIdStr, "ожидание телефона");
+    }
+
+    // Проверка, занят ли номер телефона
+    private boolean isPhoneNumberTaken(String phone) {
+        initializeDatabase();
+
+        String sql = "SELECT COUNT(*) as count FROM clients WHERE phone = ?";
+
+        try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+            pstmt.setString(1, phone);
+            ResultSet rs = pstmt.executeQuery();
+
+            if (rs.next()) {
+                return rs.getInt("count") > 0;
+            }
+        } catch (SQLException e) {
+            System.out.println("Ошибка при проверке номера телефона: " + e.getMessage());
             e.printStackTrace();
         }
+
+        return false;
+    }
+
+    // Проверка, занят ли номер телефона другим клиентом (кроме указанного)
+    private boolean isPhoneNumberTaken(String phone, int excludeClientId) {
+        initializeDatabase();
+
+        String sql = "SELECT COUNT(*) as count FROM clients WHERE phone = ? AND id != ?";
+
+        try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+            pstmt.setString(1, phone);
+            pstmt.setInt(2, excludeClientId);
+            ResultSet rs = pstmt.executeQuery();
+
+            if (rs.next()) {
+                return rs.getInt("count") > 0;
+            }
+        } catch (SQLException e) {
+            System.out.println("Ошибка при проверке номера телефона: " + e.getMessage());
+            e.printStackTrace();
+        }
+
+        return false;
+    }
+
+    // Обработка ввода телефона с валидацией
+    private void handlePhoneInput(Long chatId, String phone) {
+        String chatIdStr = chatId.toString();
+
+        // Валидация телефона
+        if (!phone.matches("^8\\d{10}$")) {
+            editMessage(chatId,
+                    "❌ Неверный формат телефона!\n\n" +
+                            "Номер должен:\n" +
+                            "• Начинаться с цифры 8\n" +
+                            "• Содержать 11 цифр\n" +
+                            "• Формат: 81234567890\n\n" +
+                            "Пожалуйста, введите номер телефона еще раз:");
+            return;
+        }
+
+        // Проверяем, не занят ли номер другим клиентом
+        if (isPhoneNumberTaken(phone)) {
+            editMessage(chatId,
+                    "❌ Этот номер телефона уже используется другим клиентом!\n\n" +
+                            "Пожалуйста, введите другой номер телефона:");
+            return;
+        }
+
+        tempDataMap.get(chatId).put("phone", phone);
+        editMessage(chatId,
+                "👤 Имя клиента: " + tempDataMap.get(chatId).get("name") + "\n" +
+                        "📱 Телефон: " + phone + "\n\n" +
+                        "🏙️ Введите город для поиска недвижимости:");
+        userStates.put(chatIdStr, "ожидание города");
+    }
+
+    // Обработка ввода города
+    private void handleCityInput(Long chatId, String city) {
+        String chatIdStr = chatId.toString();
+        tempDataMap.get(chatId).put("city", city);
+
+        editMessage(chatId,
+                "👤 Имя клиента: " + tempDataMap.get(chatId).get("name") + "\n" +
+                        "📱 Телефон: " + tempDataMap.get(chatId).get("phone") + "\n" +
+                        "🏙️ Город: " + city + "\n\n" +
+                        "Выберите тип недвижимости:");
+        showPropertyTypeSelection(chatId, "create");
+    }
+
+    // Обработка ввода даты звонка
+    private void handleCallDateInput(Long chatId, String dateTime) {
+        String chatIdStr = chatId.toString();
+        try {
+            LocalDateTime meetingTime = LocalDateTime.parse(dateTime + ":00", DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            if (meetingTime.isBefore(LocalDateTime.now())) {
+                editMessage(chatId, "Дата звонка не может быть в прошлом! Введите дату и время звонка (формат: ГГГГ-ММ-ДД ЧЧ:ММ):");
+            } else {
+                Map<String, String> data = tempDataMap.get(chatId);
+                String name = data.get("name");
+                String phone = data.get("phone");
+                String city = data.get("city");
+                String propertyType = data.get("type");
+
+                saveClientToDatabase(name, phone, city, propertyType, dateTime);
+                scheduleMeetingNotifications(chatId, name, phone, dateTime);
+
+                SendMessage message = new SendMessage();
+                message.setChatId(chatId.toString());
+                message.setText("✅ Клиент " + name + " успешно создан!\n" +
+                        "📅 Звонок назначен на: " + dateTime + "\n\n" +
+                        "Вы получите уведомления о звонке.");
+                message.setReplyMarkup(getBackToMenuKeyboard());
+                execute(message);
+
+                userStates.remove(chatIdStr);
+                tempDataMap.remove(chatId);
+            }
+        } catch (Exception e) {
+            editMessage(chatId, "Неверный формат даты! Используйте формат: ГГГГ-ММ-ДД ЧЧ:ММ\nНапример: 2025-12-25 14:30");
+        }
+    }
+
+    // Обработка изменения текстовых параметров
+    private void handleTextParameterChange(Long chatId, String text) {
+        String chatIdStr = chatId.toString();
+        String state = userStates.get(chatIdStr);
+        String param = "";
+
+        if (state.equals("изменение имени")) {
+            param = "name";
+        } else if (state.equals("изменение телефона ввод")) {
+            // Валидация телефона
+            if (!text.matches("^8\\d{10}$")) {
+                editMessage(chatId,
+                        "❌ Неверный формат телефона!\n\n" +
+                                "Номер должен:\n" +
+                                "• Начинаться с цифры 8\n" +
+                                "• Содержать 11 цифр\n" +
+                                "• Формат: 81234567890\n\n" +
+                                "Пожалуйста, введите номер телефона еще раз:");
+                return;
+            }
+
+            // Получаем ID текущего клиента
+            int clientId = Integer.parseInt(userStates.get(chatIdStr + "_clientId"));
+
+            // Проверяем, не занят ли номер другим клиентом (кроме текущего)
+            if (isPhoneNumberTaken(text, clientId)) {
+                editMessage(chatId,
+                        "❌ Этот номер телефона уже используется другим клиентом!\n\n" +
+                                "Пожалуйста, введите другой номер телефона:");
+                return;
+            }
+
+            param = "phone";
+        } else if (state.equals("изменение города")) {
+            param = "city";
+        }
+
+        int clientId = Integer.parseInt(userStates.get(chatIdStr + "_clientId"));
+        updateClientParameter(chatId, clientId, param, text);
+        userStates.remove(chatIdStr);
+        userStates.remove(chatIdStr + "_clientId");
     }
 
     // Обработка callback-запросов (нажатия на кнопки)
@@ -211,23 +343,29 @@ public class Bot extends TelegramLongPollingBot {
         Long chatId = update.getCallbackQuery().getMessage().getChatId();
         String chatIdStr = chatId.toString();
 
-        SendMessage message = new SendMessage();
-        message.setChatId(chatIdStr);
-
         try {
-            if (callbackData.equals("создать клиента")) {
-                message.setText("Введите имя клиента:");
-                userStates.put(chatIdStr, "ожидание имени");
-                execute(message);
+            // Сохраняем ID сообщения для последующего редактирования
+            int messageId = update.getCallbackQuery().getMessage().getMessageId();
+            lastMessageIdMap.put(chatId, messageId);
 
-            } else if (callbackData.equals("назначить встречу")) {
-                message.setText("Введите номер телефона клиента для поиска:");
-                userStates.put(chatIdStr, "поиск клиента для встречи");
+            if (callbackData.equals("добавить клиента")) {
+                SendMessage message = new SendMessage();
+                message.setChatId(chatIdStr);
+                message.setText("👤 Введите имя клиента:");
+                message.setReplyMarkup(null);
                 execute(message);
+                userStates.put(chatIdStr, "ожидание имени");
+
+            } else if (callbackData.equals("назначить звонок")) {
+                SendMessage message = new SendMessage();
+                message.setChatId(chatIdStr);
+                message.setText("Введите номер телефона клиента для поиска:");
+                message.setReplyMarkup(null);
+                execute(message);
+                userStates.put(chatIdStr, "поиск клиента для звонка");
 
             } else if (callbackData.equals("список клиентов")) {
                 showClientsMenu(chatId);
-                return;
 
             } else if (callbackData.startsWith("тип_")) {
                 String propertyType = callbackData.replace("тип_", "");
@@ -235,128 +373,280 @@ public class Bot extends TelegramLongPollingBot {
                     tempDataMap.put(chatId, new HashMap<>());
                 }
                 tempDataMap.get(chatId).put("type", propertyType);
-                message.setText("Введите дату и время встречи (формат: ГГГГ-ММ-ДД ЧЧ:ММ):\nПример: 2024-12-25 14:30");
-                userStates.put(chatIdStr, "ожидание даты встречи");
-                execute(message);
+
+                Map<String, String> data = tempDataMap.get(chatId);
+                editMessage(chatId,
+                        "👤 Имя клиента: " + data.get("name") + "\n" +
+                                "📱 Телефон: " + data.get("phone") + "\n" +
+                                "🏙️ Город: " + data.get("city") + "\n" +
+                                "🏠 Тип недвижимости: " + propertyType + "\n\n" +
+                                "Введите дату и время звонка (формат: ГГГГ-ММ-ДД ЧЧ:ММ):\nПример: 2025-12-25 14:30");
+                userStates.put(chatIdStr, "ожидание даты звонка");
 
             } else if (callbackData.startsWith("назначить_")) {
                 int clientId = Integer.parseInt(callbackData.replace("назначить_", ""));
                 userStates.put(chatIdStr + "_meeting_client", String.valueOf(clientId));
-                message.setText("Введите дату и время встречи (формат: ГГГГ-ММ-ДД ЧЧ:ММ):\nПример: 2024-12-25 14:30");
-                userStates.put(chatIdStr, "встреча дата");
-                execute(message);
+                editMessage(chatId, "Введите дату и время звонка (формат: ГГГГ-ММ-ДД ЧЧ:ММ):\nПример: 2025-12-25 14:30");
+                userStates.put(chatIdStr, "звонок дата");
 
             } else if (callbackData.startsWith("отложить_")) {
                 String meetingKey = callbackData.replace("отложить_", "");
                 userStates.put(chatIdStr + "_postpone", meetingKey);
                 showPostponeMenu(chatId);
-                return;
 
             } else if (callbackData.equals("отложить дни")) {
-                message.setText("Введите количество дней для переноса:");
+                editMessage(chatId, "Введите количество дней для переноса:");
                 userStates.put(chatIdStr, "отложить дни");
-                execute(message);
 
             } else if (callbackData.equals("отложить часы")) {
-                message.setText("Введите количество часов для переноса:");
+                editMessage(chatId, "Введите количество часов для переноса:");
                 userStates.put(chatIdStr, "отложить часы");
-                execute(message);
 
             } else if (callbackData.equals("отложить минуты")) {
-                message.setText("Введите количество минут для переноса:");
+                editMessage(chatId, "Введите количество минут для переноса:");
                 userStates.put(chatIdStr, "отложить минуты");
-                execute(message);
 
             } else if (callbackData.startsWith("завершить_")) {
                 String meetingKey = callbackData.replace("завершить_", "");
                 showCompletionOptions(chatId, meetingKey);
-                return;
 
             } else if (callbackData.startsWith("сделка_")) {
                 String[] parts = callbackData.split("_");
                 String meetingKey = parts[1];
                 String result = parts[2];
-                completeMeeting(chatId, meetingKey, result, message);
-                message.setReplyMarkup(getBackToMenuKeyboard());
-                execute(message);
+                completeMeeting(chatId, meetingKey, result);
 
-            } else if (callbackData.equals("ближайшие встречи")) {
+            } else if (callbackData.equals("ближайшие звонки")) {
                 showUpcomingMeetings(chatId);
-                return;
 
             } else if (callbackData.equals("весь список")) {
                 sendAllClientsFile(chatId);
-                return;
 
             } else if (callbackData.equals("список по типу")) {
                 showPropertyTypesForList(chatId);
-                return;
 
             } else if (callbackData.startsWith("фильтр_тип_")) {
                 String propertyType = callbackData.replace("фильтр_тип_", "");
                 sendClientsByTypeFile(chatId, propertyType);
-                return;
 
             } else if (callbackData.equals("изменить данные")) {
+                SendMessage message = new SendMessage();
+                message.setChatId(chatIdStr);
                 message.setText("Введите номер телефона клиента для изменения:");
-                userStates.put(chatIdStr, "изменение телефона");
+                message.setReplyMarkup(null);
                 execute(message);
+                userStates.put(chatIdStr, "изменение телефона");
 
             } else if (callbackData.equals("удалить клиента")) {
+                SendMessage message = new SendMessage();
+                message.setChatId(chatIdStr);
                 message.setText("Введите номер телефона клиента для удаления:");
-                userStates.put(chatIdStr, "удаление телефона");
+                message.setReplyMarkup(null);
                 execute(message);
+                userStates.put(chatIdStr, "удаление телефона");
 
             } else if (callbackData.equals("статистика")) {
                 showStatistics(chatId);
-                return;
 
             } else if (callbackData.equals("список сделок")) {
                 sendCompletedDealsFile(chatId, "совершена");
-                return;
 
             } else if (callbackData.equals("список отказов")) {
                 sendCompletedDealsFile(chatId, "отказ");
-                return;
 
             } else if (callbackData.startsWith("изменить_")) {
                 String param = callbackData.replace("изменить_", "");
                 String clientIdStr = userStates.get(chatIdStr + "_edit_client");
                 if (clientIdStr != null) {
                     int clientId = Integer.parseInt(clientIdStr);
-                    userStates.put(chatIdStr + "_param", param);
                     userStates.put(chatIdStr + "_clientId", String.valueOf(clientId));
-                    message.setText("Введите новое значение для " + getParamName(param) + ":");
-                    userStates.put(chatIdStr, "изменение параметра");
-                    execute(message);
-                } else {
-                    message.setText("❌ Ошибка: данные клиента не найдены.");
-                    message.setReplyMarkup(getBackToMenuKeyboard());
-                    execute(message);
+
+                    if (param.equals("property_type")) {
+                        showPropertyTypeSelection(chatId, "edit_" + clientId);
+                    } else {
+                        String messageText = "Введите новое значение для ";
+                        if (param.equals("name")) {
+                            messageText += "имени:";
+                            userStates.put(chatIdStr, "изменение имени");
+                        } else if (param.equals("phone")) {
+                            messageText += "телефона (формат: 81234567890):";
+                            userStates.put(chatIdStr, "изменение телефона ввод");
+                        } else if (param.equals("city")) {
+                            messageText += "города:";
+                            userStates.put(chatIdStr, "изменение города");
+                        }
+                        editMessage(chatId, messageText);
+                    }
                 }
+
+            } else if (callbackData.startsWith("тип_изменить_")) {
+                String[] parts = callbackData.split("_");
+                String propertyType = parts[2];
+                int clientId = Integer.parseInt(parts[3]);
+                updateClientParameter(chatId, clientId, "property_type", propertyType);
+                userStates.remove(chatIdStr + "_edit_client");
+                userStates.remove(chatIdStr + "_clientId");
 
             } else if (callbackData.startsWith("удалить_")) {
                 int clientId = Integer.parseInt(callbackData.replace("удалить_", ""));
-                deleteClient(chatId, clientId, message);
-                message.setReplyMarkup(getBackToMenuKeyboard());
-                execute(message);
+                deleteClient(chatId, clientId);
 
             } else if (callbackData.equals("назад в меню")) {
                 showMainMenu(chatId);
-                return;
 
             } else if (callbackData.equals("назад к спискам")) {
                 showClientsMenu(chatId);
-                return;
 
             } else if (callbackData.equals("меню после операции")) {
                 showMainMenu(chatId);
-                return;
             }
 
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    // Показать приветственный экран
+    private void showWelcomeScreen(Long chatId) {
+        SendMessage message = new SendMessage();
+        message.setChatId(chatId.toString());
+        message.setText("🏢 ДОБРО ПОЖАЛОВАТЬ В БОТ ДЛЯ УПРАВЛЕНИЯ КЛИЕНТАМИ ПО НЕДВИЖИМОСТИ!\n\n" +
+                "Этот бот поможет вам:\n\n" +
+                "📌 Создавать и управлять клиентами\n" +
+                "📅 Назначать и отслеживать звонки\n" +
+                "📊 Вести статистику сделок\n" +
+                "📋 Получать списки клиентов по разным критериям\n\n" +
+                "Для начала работы выберите действие в меню ниже:");
+
+        InlineKeyboardButton startBtn = InlineKeyboardButton.builder()
+                .text("🚀 Начать работу")
+                .callbackData("меню после операции")
+                .build();
+
+        InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
+                .keyboardRow(List.of(startBtn))
+                .build();
+
+        message.setReplyMarkup(keyboard);
+
+        try {
+            execute(message);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    // Редактировать существующее сообщение
+    private void editMessage(Long chatId, String text) {
+        try {
+            Integer messageId = lastMessageIdMap.get(chatId);
+            if (messageId != null) {
+                SendMessage message = new SendMessage();
+                message.setChatId(chatId.toString());
+                message.setText(text);
+                message.setReplyMarkup(null);
+
+                // Сначала отправляем новое сообщение
+                execute(message);
+
+                // Сохраняем ID нового сообщения
+                // Note: В реальности нужно получить ID отправленного сообщения,
+                // но для упрощения будем обновлять lastMessageIdMap при callback
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    // Показать выбор типа недвижимости
+    private void showPropertyTypeSelection(Long chatId, String context) {
+        SendMessage message = new SendMessage();
+        message.setChatId(chatId.toString());
+        message.setText("Выберите тип недвижимости:");
+
+        InlineKeyboardMarkup keyboard;
+        if (context.startsWith("edit_")) {
+            int clientId = Integer.parseInt(context.replace("edit_", ""));
+            keyboard = getPropertyTypeKeyboardForEdit(clientId);
+        } else {
+            keyboard = getPropertyTypeKeyboardForCreate();
+        }
+
+        message.setReplyMarkup(keyboard);
+
+        try {
+            execute(message);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    // Клавиатура для выбора типа недвижимости при создании
+    private InlineKeyboardMarkup getPropertyTypeKeyboardForCreate() {
+        InlineKeyboardButton studioBtn = InlineKeyboardButton.builder()
+                .text("🏢 Студия")
+                .callbackData("тип_студия")
+                .build();
+
+        InlineKeyboardButton oneRoomBtn = InlineKeyboardButton.builder()
+                .text("1️⃣ 1-комнатная")
+                .callbackData("тип_1-комнатная")
+                .build();
+
+        InlineKeyboardButton twoRoomBtn = InlineKeyboardButton.builder()
+                .text("2️⃣ 2-комнатная")
+                .callbackData("тип_2-комнатная")
+                .build();
+
+        InlineKeyboardButton threeRoomBtn = InlineKeyboardButton.builder()
+                .text("3️⃣ 3-комнатная")
+                .callbackData("тип_3-комнатная")
+                .build();
+
+        InlineKeyboardButton houseBtn = InlineKeyboardButton.builder()
+                .text("🏡 Дом")
+                .callbackData("тип_дом")
+                .build();
+
+        return InlineKeyboardMarkup.builder()
+                .keyboardRow(List.of(studioBtn, oneRoomBtn))
+                .keyboardRow(List.of(twoRoomBtn, threeRoomBtn))
+                .keyboardRow(List.of(houseBtn))
+                .build();
+    }
+
+    // Клавиатура для выбора типа недвижимости при редактировании
+    private InlineKeyboardMarkup getPropertyTypeKeyboardForEdit(int clientId) {
+        InlineKeyboardButton studioBtn = InlineKeyboardButton.builder()
+                .text("🏢 Студия")
+                .callbackData("тип_изменить_студия_" + clientId)
+                .build();
+
+        InlineKeyboardButton oneRoomBtn = InlineKeyboardButton.builder()
+                .text("1️⃣ 1-комнатная")
+                .callbackData("тип_изменить_1-комнатная_" + clientId)
+                .build();
+
+        InlineKeyboardButton twoRoomBtn = InlineKeyboardButton.builder()
+                .text("2️⃣ 2-комнатная")
+                .callbackData("тип_изменить_2-комнатная_" + clientId)
+                .build();
+
+        InlineKeyboardButton threeRoomBtn = InlineKeyboardButton.builder()
+                .text("3️⃣ 3-комнатная")
+                .callbackData("тип_изменить_3-комнатная_" + clientId)
+                .build();
+
+        InlineKeyboardButton houseBtn = InlineKeyboardButton.builder()
+                .text("🏡 Дом")
+                .callbackData("тип_изменить_дом_" + clientId)
+                .build();
+
+        return InlineKeyboardMarkup.builder()
+                .keyboardRow(List.of(studioBtn, oneRoomBtn))
+                .keyboardRow(List.of(twoRoomBtn, threeRoomBtn))
+                .keyboardRow(List.of(houseBtn))
+                .build();
     }
 
     // Клавиатура для возврата в меню
@@ -375,21 +665,21 @@ public class Bot extends TelegramLongPollingBot {
     private void showMainMenu(Long chatId) {
         SendMessage message = new SendMessage();
         message.setChatId(chatId.toString());
-        message.setText("🏢 БОТ ДЛЯ УПРАВЛЕНИЯ КЛИЕНТАМИ ПО НЕДВИЖИМОСТИ\n\n" +
+        message.setText("🏢 УПРАВЛЕНИЕ КЛИЕНТАМИ ПО НЕДВИЖИМОСТИ\n\n" +
                 "Выберите действие:");
 
         InlineKeyboardButton btn1 = InlineKeyboardButton.builder()
-                .text("➕ Создать клиента")
-                .callbackData("создать клиента")
+                .text("➕ Добавить клиента")
+                .callbackData("добавить клиента")
                 .build();
 
         InlineKeyboardButton btn2 = InlineKeyboardButton.builder()
-                .text("📅 Назначить встречу с клиентом")
-                .callbackData("назначить встречу")
+                .text("📅 Назначить звонок клиенту")
+                .callbackData("назначить звонок")
                 .build();
 
         InlineKeyboardButton btn3 = InlineKeyboardButton.builder()
-                .text("📋 Список клиентов")
+                .text("📋 Списки клиентов")
                 .callbackData("список клиентов")
                 .build();
 
@@ -412,11 +702,11 @@ public class Bot extends TelegramLongPollingBot {
     private void showClientsMenu(Long chatId) {
         SendMessage message = new SendMessage();
         message.setChatId(chatId.toString());
-        message.setText("📋 МЕНЮ РАБОТЫ С КЛИЕНТАМИ\n\nВыберите действие:");
+        message.setText("📋 РАБОТА С КЛИЕНТАМИ\n\nВыберите действие:");
 
         InlineKeyboardButton btn1 = InlineKeyboardButton.builder()
-                .text("📅 Ближайшие встречи")
-                .callbackData("ближайшие встречи")
+                .text("📅 Ближайшие звонки")
+                .callbackData("ближайшие звонки")
                 .build();
 
         InlineKeyboardButton btn2 = InlineKeyboardButton.builder()
@@ -451,10 +741,8 @@ public class Bot extends TelegramLongPollingBot {
 
         InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
                 .keyboardRow(List.of(btn1))
-                .keyboardRow(List.of(btn2))
-                .keyboardRow(List.of(btn3))
-                .keyboardRow(List.of(btn4))
-                .keyboardRow(List.of(btn5))
+                .keyboardRow(List.of(btn2, btn3))
+                .keyboardRow(List.of(btn4, btn5))
                 .keyboardRow(List.of(btn6))
                 .keyboardRow(List.of(btnBack))
                 .build();
@@ -466,40 +754,6 @@ public class Bot extends TelegramLongPollingBot {
         } catch (Exception e) {
             e.printStackTrace();
         }
-    }
-
-    // Клавиатура для выбора типа недвижимости
-    private InlineKeyboardMarkup getPropertyTypeKeyboard() {
-        InlineKeyboardButton studioBtn = InlineKeyboardButton.builder()
-                .text("🏢 Студия")
-                .callbackData("тип_студия")
-                .build();
-
-        InlineKeyboardButton oneRoomBtn = InlineKeyboardButton.builder()
-                .text("1️⃣ Однушка")
-                .callbackData("тип_однушка")
-                .build();
-
-        InlineKeyboardButton twoRoomBtn = InlineKeyboardButton.builder()
-                .text("2️⃣ Двушка")
-                .callbackData("тип_двушка")
-                .build();
-
-        InlineKeyboardButton threeRoomBtn = InlineKeyboardButton.builder()
-                .text("3️⃣ Трешка")
-                .callbackData("тип_трешка")
-                .build();
-
-        InlineKeyboardButton houseBtn = InlineKeyboardButton.builder()
-                .text("🏡 Дом")
-                .callbackData("тип_дом")
-                .build();
-
-        return InlineKeyboardMarkup.builder()
-                .keyboardRow(List.of(studioBtn, oneRoomBtn))
-                .keyboardRow(List.of(twoRoomBtn, threeRoomBtn))
-                .keyboardRow(List.of(houseBtn))
-                .build();
     }
 
     // Инициализация подключения к базе данных
@@ -524,37 +778,44 @@ public class Bot extends TelegramLongPollingBot {
     // Создание таблиц в базе данных
     private void createTables() throws SQLException {
         String createClientsTable = """
-            CREATE TABLE IF NOT EXISTS clients (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(100) NOT NULL,
-                phone VARCHAR(20) NOT NULL,
-                city VARCHAR(100) NOT NULL,
-                property_type VARCHAR(50) NOT NULL,
-                meeting_time DATETIME,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_phone (phone),
-                INDEX idx_meeting_time (meeting_time)
-            )
-            """;
+    CREATE TABLE IF NOT EXISTS clients (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        phone VARCHAR(20) NOT NULL UNIQUE,
+        city VARCHAR(100) NOT NULL,
+        property_type VARCHAR(50) NOT NULL,
+        meeting_time DATETIME,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_phone (phone),
+        INDEX idx_meeting_time (meeting_time)
+    )
+    """;
 
         String createDealsTable = """
-            CREATE TABLE IF NOT EXISTS deals (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                client_id INT,
-                name VARCHAR(100) NOT NULL,
-                phone VARCHAR(20) NOT NULL,
-                city VARCHAR(100) NOT NULL,
-                property_type VARCHAR(50) NOT NULL,
-                result VARCHAR(50) NOT NULL,
-                deal_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (client_id) REFERENCES clients(id)
-            )
-            """;
+    CREATE TABLE IF NOT EXISTS deals (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        client_id INT,
+        name VARCHAR(100) NOT NULL,
+        phone VARCHAR(20) NOT NULL,
+        city VARCHAR(100) NOT NULL,
+        property_type VARCHAR(50) NOT NULL,
+        result VARCHAR(50) NOT NULL,
+        deal_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """;
 
         try (Statement stmt = connection.createStatement()) {
+            // Создаем таблицу clients
             stmt.execute(createClientsTable);
+
+            // Создаем таблицу deals (она создастся только если не существует)
             stmt.execute(createDealsTable);
-            System.out.println("Таблицы созданы успешно");
+
+            System.out.println("Таблицы созданы/проверены успешно");
+
+        } catch (SQLException e) {
+            System.out.println("Ошибка при создании таблиц: " + e.getMessage());
+            throw e;
         }
     }
 
@@ -579,7 +840,7 @@ public class Bot extends TelegramLongPollingBot {
         }
     }
 
-    // Планирование уведомлений о встрече
+    // Планирование уведомлений о звонке
     private void scheduleMeetingNotifications(Long chatId, String name, String phone, String meetingTimeStr) {
         try {
             LocalDateTime meetingTime = LocalDateTime.parse(meetingTimeStr + ":00", DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
@@ -594,13 +855,13 @@ public class Bot extends TelegramLongPollingBot {
                 System.out.println("Напоминание за 5 минут запланировано на: " + notification5min);
             }
 
-            // Уведомление о начале встречи
+            // Уведомление о начале звонка
             if (meetingTime.isAfter(LocalDateTime.now())) {
                 long delayExact = Duration.between(LocalDateTime.now(), meetingTime).getSeconds();
                 scheduler.schedule(() -> {
                     sendMeetingNotificationWithMenu(chatId, name, phone, meetingTimeStr);
                 }, delayExact, TimeUnit.SECONDS);
-                System.out.println("Уведомление о начале встречи запланировано на: " + meetingTime);
+                System.out.println("Уведомление о начале звонка запланировано на: " + meetingTime);
             } else {
                 sendMeetingNotificationWithMenu(chatId, name, phone, meetingTimeStr);
             }
@@ -615,7 +876,7 @@ public class Bot extends TelegramLongPollingBot {
     private void sendSimpleReminder(Long chatId, String name, String phone, String meetingTime) {
         SendMessage message = new SendMessage();
         message.setChatId(chatId.toString());
-        message.setText("⏰ Напоминание: встреча с клиентом " + name + " через 5 минут!\n" +
+        message.setText("⏰ Напоминание: звонок с клиентом " + name + " через 5 минут!\n" +
                 "📅 Время: " + meetingTime + "\n" +
                 "📱 Телефон: " + phone);
 
@@ -627,25 +888,25 @@ public class Bot extends TelegramLongPollingBot {
         }
     }
 
-    // Отправка уведомления о встрече с меню действий
+    // Отправка уведомления о звонке с меню действий
     private void sendMeetingNotificationWithMenu(Long chatId, String name, String phone, String meetingTime) {
         SendMessage message = new SendMessage();
         message.setChatId(chatId.toString());
-        message.setText("🕐 ВСТРЕЧА НАЧАЛАСЬ!\n\n" +
+        message.setText("🕐 ВРЕМЯ ЗВОНКА!\n\n" +
                 "👤 Клиент: " + name + "\n" +
                 "📱 Телефон: " + phone + "\n" +
-                "📅 Время встречи: " + meetingTime + "\n\n" +
+                "📅 Время звонка: " + meetingTime + "\n\n" +
                 "Выберите действие:");
 
         String meetingKey = phone + "_" + System.currentTimeMillis(); // Уникальный ключ встречи
 
         InlineKeyboardButton postponeBtn = InlineKeyboardButton.builder()
-                .text("📅 Отложить встречу")
+                .text("📅 Отложить звонок")
                 .callbackData("отложить_" + meetingKey)
                 .build();
 
         InlineKeyboardButton completeBtn = InlineKeyboardButton.builder()
-                .text("✅ Заказ завершен")
+                .text("✅ Сделка завершена")
                 .callbackData("завершить_" + meetingKey)
                 .build();
 
@@ -665,11 +926,11 @@ public class Bot extends TelegramLongPollingBot {
         }
     }
 
-    // Показать меню откладывания встречи
+    // Показать меню откладывания звонка
     private void showPostponeMenu(Long chatId) {
         SendMessage message = new SendMessage();
         message.setChatId(chatId.toString());
-        message.setText("Выберите, на сколько отложить встречу:");
+        message.setText("Выберите, на сколько отложить звонок:");
 
         InlineKeyboardButton daysBtn = InlineKeyboardButton.builder()
                 .text("📅 Дни")
@@ -705,10 +966,10 @@ public class Bot extends TelegramLongPollingBot {
         }
     }
 
-    // Отложить встречу
-    private void postponeMeeting(Long chatId, String meetingKey, int days, int hours, int minutes, SendMessage message) {
+    // Отложить звонок
+    private void postponeMeeting(Long chatId, String meetingKey, int days, int hours, int minutes) {
         try {
-            System.out.println("Откладывание встречи, meetingKey: " + meetingKey);
+            System.out.println("Откладывание звонка, meetingKey: " + meetingKey);
 
             String phone;
             if (meetingKey.contains("_")) {
@@ -716,14 +977,17 @@ public class Bot extends TelegramLongPollingBot {
                 if (parts.length >= 1) {
                     phone = parts[0];
                 } else {
-                    message.setText("❌ Неверный формат данных встречи.");
+                    SendMessage message = new SendMessage();
+                    message.setChatId(chatId.toString());
+                    message.setText("❌ Неверный формат данных звонка.");
+                    execute(message);
                     return;
                 }
             } else {
                 phone = meetingKey;
             }
 
-            System.out.println("Откладывание встречи для телефона: " + phone);
+            System.out.println("Откладывание звонка для телефона: " + phone);
 
             initializeDatabase();
 
@@ -738,7 +1002,10 @@ public class Bot extends TelegramLongPollingBot {
                     Timestamp oldTimestamp = rs.getTimestamp("meeting_time");
 
                     if (oldTimestamp == null) {
-                        message.setText("❌ У клиента нет назначенной встречи.");
+                        SendMessage message = new SendMessage();
+                        message.setChatId(chatId.toString());
+                        message.setText("❌ У клиента нет назначенного звонка.");
+                        execute(message);
                         return;
                     }
 
@@ -752,7 +1019,7 @@ public class Bot extends TelegramLongPollingBot {
                         updateStmt.setTimestamp(1, Timestamp.valueOf(newTime));
                         updateStmt.setInt(2, clientId);
                         updateStmt.executeUpdate();
-                        System.out.println("Время встречи обновлено в clients");
+                        System.out.println("Время звонка обновлено в clients");
                     }
 
                     // Отмена старых задач уведомлений
@@ -770,21 +1037,37 @@ public class Bot extends TelegramLongPollingBot {
                     String newTimeStr = newTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
                     scheduleMeetingNotifications(chatId, name, phone, newTimeStr);
 
-                    message.setText("✅ Встреча отложена на:\n" +
+                    SendMessage message = new SendMessage();
+                    message.setChatId(chatId.toString());
+                    message.setText("✅ Звонок отложен на:\n" +
                             (days > 0 ? "📅 Дней: " + days + "\n" : "") +
                             (hours > 0 ? "⏰ Часов: " + hours + "\n" : "") +
                             (minutes > 0 ? "⏱️ Минут: " + minutes + "\n" : "") +
-                            "\nНовое время встречи: " + newTimeStr);
+                            "\nНовое время звонка: " + newTimeStr);
+                    message.setReplyMarkup(getBackToMenuKeyboard());
+                    execute(message);
 
-                    System.out.println("Встреча успешно отложена на новое время: " + newTimeStr);
+                    System.out.println("Звонок успешно отложен на новое время: " + newTimeStr);
                 } else {
+                    SendMessage message = new SendMessage();
+                    message.setChatId(chatId.toString());
                     message.setText("❌ Клиент с телефоном " + phone + " не найден в базе данных.");
+                    message.setReplyMarkup(getBackToMenuKeyboard());
+                    execute(message);
                     System.out.println("Клиент не найден по телефону: " + phone);
                 }
             }
         } catch (Exception e) {
-            message.setText("❌ Ошибка при откладывании встречи: " + e.getMessage());
-            System.out.println("Ошибка при откладывании встречи: " + e.getMessage());
+            SendMessage message = new SendMessage();
+            message.setChatId(chatId.toString());
+            message.setText("❌ Ошибка при откладывании звонка: " + e.getMessage());
+            message.setReplyMarkup(getBackToMenuKeyboard());
+            try {
+                execute(message);
+            } catch (Exception ex) {
+                ex.printStackTrace();
+            }
+            System.out.println("Ошибка при откладывании звонка: " + e.getMessage());
             e.printStackTrace();
         }
     }
@@ -827,8 +1110,8 @@ public class Bot extends TelegramLongPollingBot {
         }
     }
 
-    // Завершение встречи и сохранение сделки
-    private void completeMeeting(Long chatId, String meetingKey, String result, SendMessage message) {
+    // Завершение звонка и сохранение сделки
+    private void completeMeeting(Long chatId, String meetingKey, String result) {
         try {
             System.out.println("Завершение сделки, meetingKey: " + meetingKey + ", result: " + result);
 
@@ -839,7 +1122,11 @@ public class Bot extends TelegramLongPollingBot {
                 if (parts.length >= 1) {
                     phone = parts[0];
                 } else {
-                    message.setText("❌ Неверный формат данных встречи.");
+                    SendMessage message = new SendMessage();
+                    message.setChatId(chatId.toString());
+                    message.setText("❌ Неверный формат данных звонка.");
+                    message.setReplyMarkup(getBackToMenuKeyboard());
+                    execute(message);
                     return;
                 }
             } else {
@@ -862,7 +1149,6 @@ public class Bot extends TelegramLongPollingBot {
                     String propertyType = rs.getString("property_type");
 
                     // Всегда добавляем новую запись в deals, даже если клиент уже есть
-                    // Это новый заказ, поэтому всегда создаем новую запись
                     String dealSql = "INSERT INTO deals (client_id, name, phone, city, property_type, result, deal_date) VALUES (?, ?, ?, ?, ?, ?, ?)";
                     try (PreparedStatement dealStmt = connection.prepareStatement(dealSql)) {
                         dealStmt.setInt(1, clientId);
@@ -887,27 +1173,43 @@ public class Bot extends TelegramLongPollingBot {
                         }
                     }
 
+                    SendMessage message = new SendMessage();
+                    message.setChatId(chatId.toString());
                     message.setText("✅ Сделка завершена!\n" +
                             "👤 Клиент: " + name + "\n" +
                             "📱 Телефон: " + phone + "\n" +
                             "📊 Результат: " + (result.equals("совершена") ? "✅ Совершена" : "❌ Отказ"));
+                    message.setReplyMarkup(getBackToMenuKeyboard());
+                    execute(message);
 
                     System.out.println("Сделка успешно завершена для клиента: " + name);
                 } else {
+                    SendMessage message = new SendMessage();
+                    message.setChatId(chatId.toString());
                     message.setText("❌ Клиент с телефоном " + phone + " не найден.");
+                    message.setReplyMarkup(getBackToMenuKeyboard());
+                    execute(message);
                     System.out.println("Клиент не найден при завершении сделки: " + phone);
                 }
             }
         } catch (Exception e) {
+            SendMessage message = new SendMessage();
+            message.setChatId(chatId.toString());
             message.setText("❌ Ошибка при завершении сделки: " + e.getMessage());
+            message.setReplyMarkup(getBackToMenuKeyboard());
+            try {
+                execute(message);
+            } catch (Exception ex) {
+                ex.printStackTrace();
+            }
             System.out.println("Ошибка при завершении сделки: " + e.getMessage());
             e.printStackTrace();
         }
     }
 
-    // Поиск клиента для назначения встречи
+    // Поиск клиента для назначения звонка
     private void searchClientForMeeting(Long chatId, String phone) {
-        System.out.println("Поиск клиента для встречи по телефону: " + phone);
+        System.out.println("Поиск клиента для звонка по телефону: " + phone);
         initializeDatabase();
 
         String sql = "SELECT id, name, city, property_type FROM clients WHERE phone = ?";
@@ -929,10 +1231,10 @@ public class Bot extends TelegramLongPollingBot {
                         "📱 Телефон: " + phone + "\n" +
                         "🏙️ Город: " + city + "\n" +
                         "🏠 Тип недвижимости: " + propertyType + "\n\n" +
-                        "Назначить встречу?");
+                        "Назначить звонок?");
 
                 InlineKeyboardButton appointBtn = InlineKeyboardButton.builder()
-                        .text("📅 Назначить встречу")
+                        .text("📅 Назначить звонок")
                         .callbackData("назначить_" + clientId)
                         .build();
 
@@ -983,10 +1285,10 @@ public class Bot extends TelegramLongPollingBot {
         }
     }
 
-    // Обновление времени встречи
-    private void updateMeetingTime(Long chatId, int clientId, String meetingTime, SendMessage message) {
+    // Обновление времени звонка
+    private void updateMeetingTime(Long chatId, int clientId, String meetingTime) {
         try {
-            System.out.println("Обновление времени встречи для клиента ID: " + clientId + " на время: " + meetingTime);
+            System.out.println("Обновление времени звонка для клиента ID: " + clientId + " на время: " + meetingTime);
             initializeDatabase();
 
             String clientSql = "SELECT name, phone FROM clients WHERE id = ?";
@@ -1005,7 +1307,11 @@ public class Bot extends TelegramLongPollingBot {
             }
 
             if (name.isEmpty()) {
+                SendMessage message = new SendMessage();
+                message.setChatId(chatId.toString());
                 message.setText("❌ Клиент не найден.");
+                message.setReplyMarkup(getBackToMenuKeyboard());
+                execute(message);
                 return;
             }
 
@@ -1014,27 +1320,39 @@ public class Bot extends TelegramLongPollingBot {
                 pstmt.setString(1, meetingTime + ":00");
                 pstmt.setInt(2, clientId);
                 pstmt.executeUpdate();
-                System.out.println("Время встречи обновлено в clients");
+                System.out.println("Время звонка обновлено в clients");
             }
 
             scheduleMeetingNotifications(chatId, name, phone, meetingTime);
 
-            message.setText("✅ Встреча назначена!\n\n" +
+            SendMessage message = new SendMessage();
+            message.setChatId(chatId.toString());
+            message.setText("✅ Звонок назначен!\n\n" +
                     "👤 Клиент: " + name + "\n" +
                     "📱 Телефон: " + phone + "\n" +
-                    "📅 Встреча: " + meetingTime + "\n\n" +
-                    "Вы получите уведомления о встрече.");
+                    "📅 Звонок: " + meetingTime + "\n\n" +
+                    "Вы получите уведомления о звонке.");
+            message.setReplyMarkup(getBackToMenuKeyboard());
+            execute(message);
 
-            System.out.println("Встреча успешно назначена для клиента: " + name);
+            System.out.println("Звонок успешно назначен для клиента: " + name);
 
         } catch (Exception e) {
-            message.setText("❌ Ошибка при назначении встречи: " + e.getMessage());
-            System.out.println("Ошибка при назначении встречи: " + e.getMessage());
+            SendMessage message = new SendMessage();
+            message.setChatId(chatId.toString());
+            message.setText("❌ Ошибка при назначении звонка: " + e.getMessage());
+            message.setReplyMarkup(getBackToMenuKeyboard());
+            try {
+                execute(message);
+            } catch (Exception ex) {
+                ex.printStackTrace();
+            }
+            System.out.println("Ошибка при назначении звонка: " + e.getMessage());
             e.printStackTrace();
         }
     }
 
-    // Показать ближайшие встречи
+    // Показать ближайшие звонки
     private void showUpcomingMeetings(Long chatId) {
         initializeDatabase();
 
@@ -1048,7 +1366,7 @@ public class Bot extends TelegramLongPollingBot {
             ResultSet rs = stmt.executeQuery(sql);
 
             StringBuilder response = new StringBuilder();
-            response.append("📅 БЛИЖАЙШИЕ ВСТРЕЧИ (5 ближайших):\n\n");
+            response.append("📅 БЛИЖАЙШИЕ ЗВОНКИ:\n\n");
 
             int count = 1;
             while (rs.next()) {
@@ -1062,7 +1380,7 @@ public class Bot extends TelegramLongPollingBot {
             }
 
             if (count == 1) {
-                response.append("❌ Нет запланированных встреч");
+                response.append("❌ Нет запланированных звонков");
             }
 
             SendMessage message = new SendMessage();
@@ -1111,7 +1429,7 @@ public class Bot extends TelegramLongPollingBot {
 
                     Timestamp meetingTime = rs.getTimestamp("meeting_time");
                     if (meetingTime != null) {
-                        writer.write("   Встреча: " + meetingTime.toLocalDateTime().format(formatter) + "\n");
+                        writer.write("   Звонок: " + meetingTime.toLocalDateTime().format(formatter) + "\n");
                     }
 
                     writer.write("   Создан: " + rs.getTimestamp("created_at").toLocalDateTime().format(formatter) + "\n");
@@ -1150,18 +1468,18 @@ public class Bot extends TelegramLongPollingBot {
                 .build();
 
         InlineKeyboardButton oneRoomBtn = InlineKeyboardButton.builder()
-                .text("1️⃣ Однушка")
-                .callbackData("фильтр_тип_однушка")
+                .text("1️⃣ 1-комнатная")
+                .callbackData("фильтр_тип_1-комнатная")
                 .build();
 
         InlineKeyboardButton twoRoomBtn = InlineKeyboardButton.builder()
-                .text("2️⃣ Двушка")
-                .callbackData("фильтр_тип_двушка")
+                .text("2️⃣ 2-комнатная")
+                .callbackData("фильтр_тип_2-комнатная")
                 .build();
 
         InlineKeyboardButton threeRoomBtn = InlineKeyboardButton.builder()
-                .text("3️⃣ Трешка")
-                .callbackData("фильтр_тип_трешка")
+                .text("3️⃣ 3-комнатная")
+                .callbackData("фильтр_тип_3-комнатная")
                 .build();
 
         InlineKeyboardButton houseBtn = InlineKeyboardButton.builder()
@@ -1215,7 +1533,7 @@ public class Bot extends TelegramLongPollingBot {
 
                     Timestamp meetingTime = rs.getTimestamp("meeting_time");
                     if (meetingTime != null) {
-                        writer.write("   Встреча: " + meetingTime.toLocalDateTime().format(formatter) + "\n");
+                        writer.write("   Звонок: " + meetingTime.toLocalDateTime().format(formatter) + "\n");
                     }
 
                     writer.write("   Создан: " + rs.getTimestamp("created_at").toLocalDateTime().format(formatter) + "\n");
@@ -1338,7 +1656,7 @@ public class Bot extends TelegramLongPollingBot {
     }
 
     // Обновление параметра клиента
-    private void updateClientParameter(Long chatId, int clientId, String param, String newValue, SendMessage message) {
+    private void updateClientParameter(Long chatId, int clientId, String param, String newValue) {
         initializeDatabase();
 
         String sql = "UPDATE clients SET " + param + " = ? WHERE id = ?";
@@ -1349,15 +1667,31 @@ public class Bot extends TelegramLongPollingBot {
             int rows = pstmt.executeUpdate();
 
             if (rows > 0) {
+                SendMessage message = new SendMessage();
+                message.setChatId(chatId.toString());
                 message.setText("✅ Параметр успешно изменен!\n" +
                         getParamName(param) + " установлено в: " + newValue);
+                message.setReplyMarkup(getBackToMenuKeyboard());
+                execute(message);
                 System.out.println("Параметр " + param + " обновлен для клиента ID: " + clientId);
             } else {
+                SendMessage message = new SendMessage();
+                message.setChatId(chatId.toString());
                 message.setText("❌ Ошибка при изменении параметра");
+                message.setReplyMarkup(getBackToMenuKeyboard());
+                execute(message);
             }
 
-        } catch (SQLException e) {
+        } catch (Exception e) {
+            SendMessage message = new SendMessage();
+            message.setChatId(chatId.toString());
             message.setText("❌ Ошибка при обновлении данных: " + e.getMessage());
+            message.setReplyMarkup(getBackToMenuKeyboard());
+            try {
+                execute(message);
+            } catch (Exception ex) {
+                ex.printStackTrace();
+            }
             System.out.println("Ошибка при обновлении параметра: " + e.getMessage());
             e.printStackTrace();
         }
@@ -1449,7 +1783,7 @@ public class Bot extends TelegramLongPollingBot {
     }
 
     // Удаление клиента
-    private void deleteClient(Long chatId, int clientId, SendMessage message) {
+    private void deleteClient(Long chatId, int clientId) {
         initializeDatabase();
 
         String sql = "DELETE FROM clients WHERE id = ?";
@@ -1459,23 +1793,40 @@ public class Bot extends TelegramLongPollingBot {
             int rows = pstmt.executeUpdate();
 
             if (rows > 0) {
+                SendMessage message = new SendMessage();
+                message.setChatId(chatId.toString());
                 message.setText("✅ Клиент успешно удален!");
-
-                String deleteDealsSql = "DELETE FROM deals WHERE client_id = ?";
-                try (PreparedStatement dealsStmt = connection.prepareStatement(deleteDealsSql)) {
-                    dealsStmt.setInt(1, clientId);
-                    dealsStmt.executeUpdate();
+                message.setReplyMarkup(getBackToMenuKeyboard());
+                try {
+                    execute(message);
+                } catch (TelegramApiException e) {
+                    throw new RuntimeException(e);
                 }
-
-                System.out.println("Клиент ID: " + clientId + " удален из всех таблиц");
+                System.out.println("Клиент ID: " + clientId + " удален");
             } else {
-                message.setText("❌ Ошибка при удалении клиента");
+                SendMessage message = new SendMessage();
+                message.setChatId(chatId.toString());
+                message.setText("❌ Клиент не найден для удаления");
+                message.setReplyMarkup(getBackToMenuKeyboard());
+                try {
+                    execute(message);
+                } catch (TelegramApiException e) {
+                    throw new RuntimeException(e);
+                }
             }
 
             userStates.remove(chatId.toString());
 
         } catch (SQLException e) {
+            SendMessage message = new SendMessage();
+            message.setChatId(chatId.toString());
             message.setText("❌ Ошибка при удалении клиента: " + e.getMessage());
+            message.setReplyMarkup(getBackToMenuKeyboard());
+            try {
+                execute(message);
+            } catch (Exception ex) {
+                ex.printStackTrace();
+            }
             System.out.println("Ошибка при удалении клиента: " + e.getMessage());
             e.printStackTrace();
         }
